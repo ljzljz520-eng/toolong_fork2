@@ -48,6 +48,7 @@ class NewBreaks(Message):
     breaks: list[int]
     scanned_size: int = 0
     tail: bool = False
+    replace: bool = False
 
     def __rich_repr__(self) -> rich.repr.Result:
         yield "scanned_size", self.scanned_size

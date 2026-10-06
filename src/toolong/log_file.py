@@ -31,11 +31,12 @@ class LogFile:
         self.path = Path(path)
         self.name = self.path.name
         self.file: IO[bytes] | None = None
-        self.size = 0
+        self._size = 0
         self.can_tail = False
         self.timestamp_scanner = TimestampScanner()
         self.format_parser = FormatParser()
         self._lock = Lock()
+        self._source = None  # CompressionSource for compressed files
 
     def __rich_repr__(self) -> rich.repr.Result:
         yield self.name
@@ -43,17 +44,30 @@ class LogFile:
 
     @property
     def is_open(self) -> bool:
-        return self.file is not None
+        return self.file is not None or self._source is not None
 
     @property
     def fileno(self) -> int:
+        if self._source is not None:
+            return self._source.fileno
         assert self.file is not None
         return self.file.fileno()
+
+    @property
+    def size(self) -> int:
+        if self._source is not None:
+            return self._source.materialized_size
+        return self._size
 
     @property
     def is_compressed(self) -> bool:
         _, encoding = mimetypes.guess_type(self.path.name, strict=False)
         return encoding in ("gzip", "bzip2")
+
+    @property
+    def source(self):
+        """The backing CompressionSource, if this is a compressed file."""
+        return self._source
 
     def parse(self, line: str) -> ParseResult:
         """Parse a line."""
@@ -79,52 +93,48 @@ class LogFile:
 
         # Open compressed files
         if encoding in ("gzip", "bzip2"):
-            return self.open_compressed(exit_event, encoding)
+            # An empty file carries no gzip / bzip2 header; treat it like an
+            # ordinary (empty) file rather than reporting a corrupt stream.
+            try:
+                if self.path.stat().st_size == 0:
+                    encoding = ""
+            except OSError:
+                pass
+            if encoding:
+                return self.open_compressed(exit_event, encoding)
 
         # Open uncompressed file
         self.file = open(self.path, "rb", buffering=0)
 
         self.file.seek(0, os.SEEK_END)
-        self.size = self.file.tell()
+        self._size = self.file.tell()
         self.can_tail = True
         return True
 
     def open_compressed(self, exit_event: Event, encoding: str) -> bool:
-        from tempfile import TemporaryFile
+        from toolong.compression import get_registry
 
-        chunk_size = 1024 * 256
-
-        temp_file = TemporaryFile("wb+")
-
-        compressed_file: IO[bytes]
-        if encoding == "gzip":
-            import gzip
-
-            compressed_file = gzip.open(self.path, "rb")
-        elif encoding == "bzip2":
-            import bz2
-
-            compressed_file = bz2.open(self.path, "rb")
-        else:
-            # Shouldn't get here
-            raise AssertionError("Not supported")
-
+        registry = get_registry()
+        source = registry.acquire(str(self.path.resolve()), encoding)
         try:
-            while data := compressed_file.read(chunk_size):
-                temp_file.write(data)
-                if exit_event.is_set():
-                    temp_file.close()
-                    return False
-        finally:
-            compressed_file.close()
-
-        temp_file.flush()
-        self.file = temp_file
-        self.size = temp_file.tell()
+            ready = source.start_and_wait(exit_event)
+        except BaseException:
+            registry.release(source)
+            raise
+        if not ready:
+            registry.release(source)
+            return False
+        self._source = source
         self.can_tail = False
         return True
 
     def close(self) -> None:
+        if self._source is not None:
+            from toolong.compression import get_registry
+
+            source = self._source
+            self._source = None
+            get_registry().release(source)
         if self.file is not None:
             self.file.close()
             self.file = None
@@ -132,6 +142,8 @@ class LogFile:
     if IS_WINDOWS:
 
         def get_raw(self, start: int, end: int) -> bytes:
+            if self._source is not None:
+                return self._source.read(start, end)
             with self._lock:
                 if start >= end or self.file is None:
                     return b""
@@ -145,6 +157,8 @@ class LogFile:
     else:
 
         def get_raw(self, start: int, end: int) -> bytes:
+            if self._source is not None:
+                return self._source.read(start, end)
             if start >= end or self.file is None:
                 return b""
             return os.pread(self.fileno, end - start, start)
@@ -199,9 +213,27 @@ class LogFile:
         finally:
             log_mmap.close()
 
+    def scan_compressed_line_breaks(
+        self, cancel_event
+    ) -> Iterable[tuple[int, list[int], float]]:
+        """Forward newline scan backed by the CompressionSource.
+
+        Yields ``(materialised_position, newline_offsets, progress_fraction)``
+        tuples as decompression progresses.
+        """
+        source = self._source
+        if source is None:
+            return
+        yield from source.scan_line_breaks(cancel_event)
+
     def scan_timestamps(
-        self, batch_time: float = 0.25
+        self, batch_time: float = 0.25, cancel_event=None
     ) -> Iterable[list[tuple[int, int, float]]]:
+        if self._source is not None:
+            yield from self._scan_timestamps_compressed(
+                batch_time=batch_time, cancel_event=cancel_event
+            )
+            return
         size = self.size
         if not size:
             return
@@ -236,3 +268,89 @@ class LogFile:
                 append = results.append
         if results:
             yield results
+
+    # -- compressed timestamp scan -----------------------------------------
+
+    def _scan_timestamps_compressed(
+        self, batch_time: float = 0.25, cancel_event=None
+    ) -> Iterable[list[tuple[int, int, float]]]:
+        from toolong.compression import MAX_SIDECAR_LINES
+
+        source = self._source
+        assert source is not None
+        # Timestamps describe the whole file, so the background materialiser
+        # must finish (with full CRC validation) first.
+        try:
+            if not source.wait_done(cancel_event):
+                return
+        except Exception:
+            # Fatal corruption: the caller (merge) gets no records for file.
+            return
+        if source.fatal_error is not None or source.materialized_size == 0:
+            return
+        size = source.materialized_size
+
+        cached = source.load_timestamp_sidecar()
+        if cached is not None:
+            batch: list[tuple[int, int, float]] = []
+            for record in cached:
+                batch.append(record)
+                if len(batch) >= 1000:
+                    yield batch
+                    batch = []
+            if batch:
+                yield batch
+            return
+
+        monotonic = time.monotonic
+        scan_time = monotonic()
+        scan = self.timestamp_scanner.scan
+        line_no = 0
+        position = 0
+        results: list[tuple[int, int, float]] = []
+        to_persist: list[tuple[int, int, float]] = []
+
+        def process(raw_line: bytes) -> None:
+            nonlocal line_no, position
+            line = raw_line.decode("utf-8", errors="replace")
+            timestamp = scan(line)
+            position += len(raw_line)
+            record = (line_no, position, timestamp.timestamp() if timestamp else 0.0)
+            results.append(record)
+            if line_no < MAX_SIDECAR_LINES:
+                to_persist.append(record)
+            line_no += 1
+
+        read_size = 1024 * 1024
+        offset = 0
+        carry = b""
+        while offset < size:
+            chunk = source.spool.pread(offset, min(read_size, size - offset))
+            if not chunk:
+                break
+            offset += len(chunk)
+            data = carry + chunk
+            search_from = 0
+            while True:
+                newline = data.find(b"\n", search_from)
+                if newline < 0:
+                    carry = data[search_from:]
+                    break
+                process(data[search_from : newline + 1])
+                search_from = newline + 1
+                if (
+                    results
+                    and len(results) % 1000 == 0
+                    and monotonic() - scan_time > batch_time
+                ):
+                    scan_time = monotonic()
+                    yield results
+                    results = []
+            if cancel_event is not None and cancel_event.is_set():
+                return
+        if carry:
+            process(carry)
+        if results:
+            yield results
+        if to_persist and line_no < MAX_SIDECAR_LINES:
+            source.save_timestamp_sidecar(to_persist)

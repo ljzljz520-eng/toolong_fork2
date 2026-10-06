@@ -126,3 +126,10 @@ class UI(App):
 
     def on_unmount(self) -> None:
         self.watcher.close()
+        # Tear down any shared compression sources (threads + spool files).
+        try:
+            from toolong.compression import get_registry
+
+            get_registry().close_all()
+        except Exception:
+            pass

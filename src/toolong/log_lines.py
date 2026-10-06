@@ -317,6 +317,10 @@ class LogLines(ScrollView, inherit_bindings=False):
             self.loading = False
             return
 
+        if self.log_file.source is not None:
+            self._run_compressed_scan(worker)
+            return
+
         size = self.log_file.size
 
         if not size:
@@ -338,6 +342,94 @@ class LogLines(ScrollView, inherit_bindings=False):
                 break
         self.post_message(ScanComplete(size, position))
 
+    def _run_compressed_scan(self, worker: Worker) -> None:
+        """Incremental decompression + newline scan for gzip / bzip2 files.
+
+        A validated breaks sidecar (from a previous open) is offered to the UI
+        immediately; the background materialiser still verifies it against the
+        live stream and replaces it on any mismatch.
+        """
+        log_file = self.log_file
+        source = log_file.source
+        assert source is not None
+
+        tentative = source.initial_breaks
+        have_tentative = bool(tentative)
+        line_count = 0
+        if have_tentative:
+            self.post_message(
+                NewBreaks(
+                    log_file,
+                    list(tentative),
+                    scanned_size=tentative[-1],
+                )
+            )
+            line_count = len(tentative)
+
+        position = 0
+        cancelled = False
+        for position, breaks, fraction in log_file.scan_compressed_line_breaks(
+            worker.cancelled_event
+        ):
+            if worker.is_cancelled:
+                cancelled = True
+                break
+            if not have_tentative and breaks:
+                self.post_message(
+                    NewBreaks(log_file, list(breaks), scanned_size=position)
+                )
+                line_count += len(breaks)
+            line_count_thousands = line_count // 1000
+            message = (
+                f"Decompressing… ({line_count_thousands:,}K lines)"
+                " - ESCAPE to cancel"
+            )
+            self.post_message(ScanProgress(message, fraction))
+
+        fatal = source.fatal_error
+        final_size = source.materialized_size
+        canonical = source.get_breaks()
+        ends_with_newline = (
+            bool(final_size) and source.read(final_size - 1, 1) == b"\n"
+        )
+        final_breaks = canonical + ([] if ends_with_newline else [final_size])
+
+        if not cancelled and have_tentative:
+            if fatal is None and source.sidecar_verified and list(tentative) == canonical:
+                if not ends_with_newline:
+                    self.post_message(
+                        NewBreaks(log_file, [final_size], scanned_size=final_size)
+                    )
+            else:
+                # Stale sidecar or corrupt stream: replace with the breaks
+                # actually observed during materialisation (message handled on
+                # the UI thread to avoid racing the breaks list).
+                self.post_message(
+                    NewBreaks(
+                        log_file,
+                        final_breaks,
+                        scanned_size=final_size,
+                        replace=True,
+                    )
+                )
+        elif (
+            not cancelled
+            and final_breaks
+            and final_breaks[-1] == final_size
+            and not ends_with_newline
+        ):
+            self.post_message(
+                NewBreaks(log_file, [final_size], scanned_size=final_size)
+            )
+
+        if fatal is not None:
+            self.notify(
+                f"{log_file.name!r} is corrupt or unsupported after "
+                f"{final_size:,} bytes: {fatal}",
+                severity="error",
+            )
+        self.post_message(ScanComplete(final_size, 0))
+
     def merge_log_files(self) -> None:
         worker = get_current_worker()
         self._merge_lines = []
@@ -355,6 +447,17 @@ class LogLines(ScrollView, inherit_bindings=False):
 
         self.loading = False
 
+        # Compressed sources only know their final logical size once the
+        # background materialiser has finished; timestamp scanning waits too,
+        # but the merge progress denominator needs it up front.
+        for log_file in self.log_files:
+            source = log_file.source
+            if source is not None:
+                try:
+                    source.wait_done(worker.cancelled_event)
+                except Exception:
+                    pass
+
         total_size = sum(log_file.size for log_file in self.log_files)
         position = 0
 
@@ -365,7 +468,9 @@ class LogLines(ScrollView, inherit_bindings=False):
             append = line_breaks.append
             meta: list[tuple[float, int, LogFile]] = []
             append_meta = meta.append
-            for timestamps in log_file.scan_timestamps():
+            for timestamps in log_file.scan_timestamps(
+                cancel_event=worker.cancelled_event
+            ):
                 break_position = 0
 
                 for line_no, break_position, timestamp in timestamps:
@@ -556,7 +661,8 @@ class LogLines(ScrollView, inherit_bindings=False):
 
     def on_unmount(self) -> None:
         self._line_reader.stop()
-        self.log_file.close()
+        for log_file in self.log_files:
+            log_file.close()
 
     def on_idle(self) -> None:
         self.update_virtual_size()
@@ -926,12 +1032,15 @@ class LogLines(ScrollView, inherit_bindings=False):
         event.stop()
         self._scanned_size = max(self._scanned_size, event.scanned_size)
 
-        if not self.tail and event.tail:
-            self.post_message(PendingLines(len(line_breaks) - self._line_count + 1))
+        if event.replace:
+            line_breaks[:] = list(event.breaks)
+        else:
+            if not self.tail and event.tail:
+                self.post_message(PendingLines(len(line_breaks) - self._line_count + 1))
 
-        line_breaks.extend(event.breaks)
-        if not event.tail:
-            line_breaks.sort()
+            line_breaks.extend(event.breaks)
+            if not event.tail:
+                line_breaks.sort()
 
         pointer_distance_from_end = (
             None
@@ -972,7 +1081,11 @@ class LogLines(ScrollView, inherit_bindings=False):
         self._scan_start = event.scan_start
         self.update_line_count()
         self.refresh()
-        if len(self.log_files) == 1 and self.can_tail:
+        if (
+            len(self.log_files) == 1
+            and self.can_tail
+            and self.log_file.can_tail
+        ):
             self.start_tail()
 
     @on(ScanProgress)
